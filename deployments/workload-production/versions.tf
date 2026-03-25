@@ -1,0 +1,1 @@
+# Terraform version constraints are defined in main.tf

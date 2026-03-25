@@ -1,0 +1,177 @@
+{
+  "version": "2021.12",
+  "core-network-configuration": {
+    "asn-ranges": ["64512-65534"],
+    "vpn-ecmp-support": false,
+    "dns-support": true,
+    "security-group-referencing-support": false,
+    "edge-locations": [
+      {
+        "location": "us-east-1"
+      }
+    ]
+  },
+  "segments": [
+    {
+      "name": "ingress",
+      "edge-locations": ["us-east-1"],
+      "require-attachment-acceptance": false
+    },
+    {
+      "name": "egress",
+      "edge-locations": ["us-east-1"],
+      "require-attachment-acceptance": false
+    },
+    {
+      "name": "inspection",
+      "edge-locations": ["us-east-1"],
+      "require-attachment-acceptance": false
+    },
+    {
+      "name": "sharedservices",
+      "edge-locations": ["us-east-1"],
+      "require-attachment-acceptance": false
+    },
+    {
+      "name": "production",
+      "edge-locations": ["us-east-1"],
+      "require-attachment-acceptance": false
+    },
+    {
+      "name": "development",
+      "edge-locations": ["us-east-1"],
+      "require-attachment-acceptance": false
+    },
+    {
+      "name": "staging",
+      "edge-locations": ["us-east-1"],
+      "require-attachment-acceptance": false
+    },
+    {
+      "name": "sandbox",
+      "edge-locations": ["us-east-1"],
+      "require-attachment-acceptance": false
+    }
+  ],
+  "network-function-groups": [
+    {
+      "name": "EgressInspectionVpcs",
+      "require-attachment-acceptance": false
+    },
+    {
+      "name": "InspectionVpcs",
+      "require-attachment-acceptance": false
+    }
+  ],
+  "segment-actions": [
+    {
+      "action": "share",
+      "mode": "attachment-route",
+      "segment": "sharedservices",
+      "share-with": ["production", "development", "staging", "sandbox"]
+    },
+    {
+      "action": "share",
+      "mode": "attachment-route",
+      "segment": "ingress",
+      "share-with": ["production", "development", "staging", "sandbox", "sharedservices"]
+    },
+    {
+      "action": "send-via",
+      "mode": "dual-hop",
+      "segment": "production",
+      "via": {
+        "network-function-groups": ["InspectionVpcs"]
+      },
+      "when-sent-to": {
+        "segments": ["egress"]
+      }
+    },
+    {
+      "action": "send-via",
+      "mode": "dual-hop",
+      "segment": "development",
+      "via": {
+        "network-function-groups": ["InspectionVpcs"]
+      },
+      "when-sent-to": {
+        "segments": ["egress", "production"]
+      }
+    },
+    {
+      "action": "send-via",
+      "mode": "dual-hop",
+      "segment": "staging",
+      "via": {
+        "network-function-groups": ["InspectionVpcs"]
+      },
+      "when-sent-to": {
+        "segments": ["egress", "production"]
+      }
+    },
+    {
+      "action": "send-via",
+      "mode": "dual-hop",
+      "segment": "sandbox",
+      "via": {
+        "network-function-groups": ["InspectionVpcs"]
+      },
+      "when-sent-to": {
+        "segments": ["egress", "production"]
+      }
+    },
+    {
+      "action": "send-to",
+      "segment": "egress",
+      "via": {
+        "network-function-groups": ["EgressInspectionVpcs"]
+      }
+    }
+  ],
+  "attachment-policies": [
+    {
+      "rule-number": 100,
+      "condition-logic": "or",
+      "conditions": [
+        {
+          "type": "tag-value",
+          "operator": "equals",
+          "key": "nfg",
+          "value": "inspection"
+        }
+      ],
+      "action": {
+        "add-to-network-function-group": "InspectionVpcs"
+      }
+    },
+    {
+      "rule-number": 200,
+      "condition-logic": "or",
+      "conditions": [
+        {
+          "type": "tag-value",
+          "operator": "equals",
+          "key": "nfg",
+          "value": "egressinspection"
+        }
+      ],
+      "action": {
+        "add-to-network-function-group": "EgressInspectionVpcs"
+      }
+    },
+    {
+      "rule-number": 300,
+      "condition-logic": "or",
+      "conditions": [
+        {
+          "type": "tag-exists",
+          "key": "segment"
+        }
+      ],
+      "action": {
+        "association-method": "tag",
+        "tag-value-of-key": "segment"
+      }
+    }
+  ]
+}

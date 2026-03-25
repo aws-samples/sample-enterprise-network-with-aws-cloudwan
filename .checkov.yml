@@ -1,0 +1,98 @@
+# Checkov Configuration
+# https://www.checkov.io/2.Basics/CLI%20Command%20Reference.html
+
+# Frameworks to scan
+framework:
+  - terraform
+  - secrets
+
+# Directories to skip
+skip-path:
+  - .terraform
+  - .git
+  - node_modules
+  - .github/workflows
+
+# Checks to skip (with justification)
+skip-check:
+  # CloudWAN and Network Manager resources don't support encryption at rest
+  - CKV_AWS_260  # Ensure CloudWatch log groups are encrypted
+  - CKV_AWS_338  # Ensure CloudWatch log groups retain logs for at least 1 year
+
+  # CloudWatch Log Groups - KMS CMK encryption optional for flow/firewall logs; managed key sufficient
+  - CKV_AWS_158  # Ensure CloudWatch log groups are encrypted with KMS CMK
+
+  # Network Firewall - managed key sufficient; deletion protection disabled for non-prod teardown
+  - CKV_AWS_344  # Ensure Network Firewall has deletion protection enabled
+  - CKV_AWS_345  # Ensure Network Firewall rule groups are encrypted with KMS CMK
+  - CKV_AWS_346  # Ensure Network Firewall policy is encrypted with KMS CMK
+
+  # IPAM - we use IPAM for dynamic allocation
+  - CKV_AWS_356  # Ensure VPC uses IPAM for CIDR allocation
+
+  # SSM Parameter Store - all parameters store non-sensitive cross-account config values
+  # (network IDs, account IDs, CIDRs, attachment IDs) required for cross-account pipeline
+  # access. Encryption would break cross-account reads without complex KMS key policy setup.
+  - CKV_AWS_337  # Ensure SSM parameters are using KMS CMK
+  - CKV2_AWS_34  # AWS SSM Parameter should be Encrypted
+
+  # Security Groups - pre-created SGs for inspection VPC are attached via CloudWAN
+  # policy and CheckPoint appliances, not directly to ENIs visible to Checkov
+  - CKV2_AWS_5   # Ensure Security Groups are attached to another resource
+
+  # IAM - AssumeRole restricted to management account root with OrgID condition
+  - CKV_AWS_61   # Ensure IAM role does not allow assume role from all principals
+  # IAM policy - Describe/List/Get actions for IPAM/NetworkManager are global, cannot be resource-scoped
+  - CKV_AWS_355  # Ensure IAM policies do not use wildcard resource
+
+  # GWLB - uses GENEVE protocol (port 6081), HTTPS check not applicable to gateway load balancers
+  - CKV_AWS_2    # Ensure ALB/GWLB listener uses HTTPS
+
+  # ALB access logs S3 bucket - transient operational data; recursive logging not applicable
+  - CKV_AWS_144  # Ensure S3 bucket has cross-region replication enabled
+  - CKV_AWS_145  # Ensure S3 bucket is encrypted with KMS CMK
+  - CKV_AWS_18   # Ensure S3 bucket has access logging enabled (this IS the log bucket)
+  - CKV2_AWS_62  # Ensure S3 bucket has event notifications enabled
+  - CKV_AWS_300  # Ensure S3 lifecycle policy has abort_incomplete_multipart_upload configured
+
+  # Route53 private hosted zones - DNSSEC and query logging not supported for private zones
+  - CKV2_AWS_38  # Ensure Route53 public hosted zone has DNSSEC signing enabled
+  - CKV2_AWS_39  # Ensure Route53 public hosted zone has query logging enabled
+
+  # CloudFront - single VPC origin by design; WAF and response headers managed separately
+  - CKV_AWS_310  # Ensure CloudFront distribution has origin failover configured
+  - CKV2_AWS_32  # Ensure CloudFront distribution has a response headers policy
+  - CKV2_AWS_47  # Ensure CloudFront distribution has WAFv2 Log4j AMR rule enabled
+
+# Soft fail mode - DISABLED for CI/CD (fail the build on security issues)
+soft-fail: false
+
+# Compact output
+compact: true
+
+# Quiet mode - reduce noise
+quiet: false
+
+# Download external modules
+download-external-modules: false
+
+# Evaluate variables
+evaluate-variables: true
+
+# Output formats
+output:
+  - cli
+  - json
+
+# Severity threshold (CRITICAL, HIGH, MEDIUM, LOW)
+# Only report issues at or above this severity
+# check-threshold: MEDIUM
+
+# Enable secret scanning
+enable-secret-scan-all-files: false
+
+# Baseline file for suppressing known issues
+# baseline: .checkov.baseline
+
+# Custom policies directory (if you have custom checks)
+# external-checks-dir: .checkov-policies

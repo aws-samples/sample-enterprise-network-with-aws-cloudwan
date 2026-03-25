@@ -1,0 +1,88 @@
+# Terraform files
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+.terraform/
+.terraform.lock.hcl
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+.vscode/
+*.iml
+.DS_Store
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Local development
+local/
+temp/
+tmp/
+
+# Sensitive files
+*.pem
+*.key
+*.pub
+secrets/
+.env
+.env.local
+
+# Build artifacts
+dist/
+build/
+*.zip
+
+# Test coverage
+coverage/
+*.lcov
+
+# Node modules (if using CDK or other tools)
+node_modules/
+package-lock.json
+yarn.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+
+# Checkov cache
+.checkov/
+
+# Terraform Cloud
+.terraformrc
+terraform.rc
+
+# AWS CLI
+.aws/
+aws_credentials
+
+# Git
+.git/
+.gitkeep
+
+# Documentation build
+site/
+docs/_build/
+
+# Backup files
+*.bak
+*.backup
+*.orig

@@ -1,0 +1,649 @@
+name: Terraform Network Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_folder:
+        description: 'Deployment folder to deploy'
+        required: true
+        type: choice
+        options:
+          - network-core
+          - network-egress
+          - network-inspection
+          - workload-production
+          - workload-development
+      action:
+        description: 'Terraform action'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+      auto_approve:
+        description: 'Auto-approve apply/destroy (use with caution)'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  TF_VERSION: "1.6.0"
+  AWS_DEFAULT_REGION: "us-east-1"
+  STATE_BUCKET_PREFIX: "terraform-state-network"
+
+jobs:
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    outputs:
+      scan-passed: ${{ steps.scan-result.outputs.passed }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@c85c95e3d7251135ab7dc9ce3241c5835cc595a9 # v4.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@0a5c61591373683ada2c718d72e20e999d6742a7 # v5.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Install Checkov
+        run: |
+          pip install checkov==3.2.0
+          checkov --version
+
+      - name: Run Checkov scan on deployment folder
+        id: checkov
+        continue-on-error: true
+        env:
+          DEPLOYMENT_FOLDER: ${{ github.event.inputs.deployment_folder }}
+        run: |
+          SCAN_PATH="deployments/$DEPLOYMENT_FOLDER"
+          
+          echo "## 🔒 Pre-Deployment Security Scan" >> $GITHUB_STEP_SUMMARY
+          echo "**Scanning:** $SCAN_PATH" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          checkov \
+            --directory "$SCAN_PATH" \
+            --framework terraform \
+            --output cli \
+            --output json \
+            --output-file-path console,checkov-results.json \
+            --compact \
+            --skip-check CKV_AWS_260,CKV_AWS_338 \
+            | tee checkov-output.txt
+          
+          CHECKOV_EXIT_CODE=${PIPESTATUS[0]}
+          
+          if [ -f "checkov-results.json" ]; then
+            PASSED=$(jq '.summary.passed' checkov-results.json)
+            FAILED=$(jq '.summary.failed' checkov-results.json)
+            CRITICAL_COUNT=$(jq '[.results.failed_checks[] | select(.severity == "CRITICAL")] | length' checkov-results.json)
+            HIGH_COUNT=$(jq '[.results.failed_checks[] | select(.severity == "HIGH")] | length' checkov-results.json)
+            
+            echo "**Results:**" >> $GITHUB_STEP_SUMMARY
+            echo "- ✅ Passed: $PASSED" >> $GITHUB_STEP_SUMMARY
+            echo "- ❌ Failed: $FAILED" >> $GITHUB_STEP_SUMMARY
+            echo "- 🔴 Critical: $CRITICAL_COUNT" >> $GITHUB_STEP_SUMMARY
+            echo "- 🟠 High: $HIGH_COUNT" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            echo "critical_count=$CRITICAL_COUNT" >> $GITHUB_OUTPUT
+            echo "high_count=$HIGH_COUNT" >> $GITHUB_OUTPUT
+            echo "total_failed=$FAILED" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Evaluate scan results
+        id: scan-result
+        run: |
+          CRITICAL_COUNT="${{ steps.checkov.outputs.critical_count || 0 }}"
+          HIGH_COUNT="${{ steps.checkov.outputs.high_count || 0 }}"
+          
+          if [ $((CRITICAL_COUNT + HIGH_COUNT)) -gt 0 ]; then
+            echo "passed=false" >> $GITHUB_OUTPUT
+            echo "## 🚨 Security Scan Failed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Found $CRITICAL_COUNT critical and $HIGH_COUNT high severity issues." >> $GITHUB_STEP_SUMMARY
+            echo "Deployment blocked. Fix security issues before deploying." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "passed=true" >> $GITHUB_OUTPUT
+            echo "✅ Security scan passed - proceeding with deployment" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload scan results
+        if: always()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.1
+        with:
+          name: security-scan-${{ github.event.inputs.deployment_folder }}
+          path: |
+            checkov-results.json
+            checkov-output.txt
+          retention-days: 30
+
+  setup-backend:
+    name: Setup Terraform Backend
+    runs-on: ubuntu-latest
+    needs: security-scan
+    outputs:
+      bucket-name: ${{ steps.backend-config.outputs.bucket-name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@c85c95e3d7251135ab7dc9ce3241c5835cc595a9 # v4.0.0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6708b3c5206585abc1dbb8d1d # v4.0.2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Setup backend resources
+        id: backend-config
+        env:
+          DEPLOYMENT_FOLDER: ${{ github.event.inputs.deployment_folder }}
+          STATE_BUCKET_PREFIX: ${{ env.STATE_BUCKET_PREFIX }}
+          AWS_DEFAULT_REGION: ${{ env.AWS_DEFAULT_REGION }}
+        run: |
+          # Extract deployment target account ID from terraform.tfvars
+          TFVARS_FILE="deployments/$DEPLOYMENT_FOLDER/terraform.tfvars"
+          
+          if [ -f "$TFVARS_FILE" ]; then
+            # Priority order based on deployment type:
+            # 1. application_account_id (workload-production, workload-development)
+            # 2. security_account_id (network-inspection)
+            # 3. network_services_account_id (network-egress, network-core)
+            # 4. network_core_account_id (fallback)
+            
+            DEPLOYMENT_ACCOUNT_ID=$(grep -E '^\s*application_account_id\s*=' "$TFVARS_FILE" | head -1 | sed -E 's/.*=\s*"?([0-9]+)"?.*/\1/')
+            
+            if [ -z "$DEPLOYMENT_ACCOUNT_ID" ]; then
+              DEPLOYMENT_ACCOUNT_ID=$(grep -E '^\s*security_account_id\s*=' "$TFVARS_FILE" | head -1 | sed -E 's/.*=\s*"?([0-9]+)"?.*/\1/')
+            fi
+            
+            if [ -z "$DEPLOYMENT_ACCOUNT_ID" ]; then
+              DEPLOYMENT_ACCOUNT_ID=$(grep -E '^\s*network_services_account_id\s*=' "$TFVARS_FILE" | head -1 | sed -E 's/.*=\s*"?([0-9]+)"?.*/\1/')
+            fi
+            
+            if [ -z "$DEPLOYMENT_ACCOUNT_ID" ]; then
+              DEPLOYMENT_ACCOUNT_ID=$(grep -E '^\s*network_core_account_id\s*=' "$TFVARS_FILE" | head -1 | sed -E 's/.*=\s*"?([0-9]+)"?.*/\1/')
+            fi
+            
+            if [ -z "$DEPLOYMENT_ACCOUNT_ID" ]; then
+              echo "❌ Error: Could not find deployment account ID in $TFVARS_FILE"
+              echo "Looked for: application_account_id, security_account_id, network_services_account_id, or network_core_account_id"
+              exit 1
+            fi
+            
+            echo "Deployment target account ID: $DEPLOYMENT_ACCOUNT_ID"
+          else
+            echo "❌ Error: terraform.tfvars not found at $TFVARS_FILE"
+            exit 1
+          fi
+          
+          # Bucket name uses deployment account ID (created in management account)
+          BUCKET_NAME="$STATE_BUCKET_PREFIX-${DEPLOYMENT_ACCOUNT_ID}"
+          
+          echo "bucket-name=$BUCKET_NAME" >> $GITHUB_OUTPUT
+          
+          # Create S3 bucket if it doesn't exist (in management account)
+          if ! aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
+            echo "Creating S3 bucket: $BUCKET_NAME in management account"
+            aws s3api create-bucket --bucket "$BUCKET_NAME" --region "$AWS_DEFAULT_REGION"
+            
+            # Enable versioning
+            aws s3api put-bucket-versioning \
+              --bucket "$BUCKET_NAME" \
+              --versioning-configuration Status=Enabled
+            
+            # Enable encryption
+            aws s3api put-bucket-encryption \
+              --bucket "$BUCKET_NAME" \
+              --server-side-encryption-configuration '{
+                "Rules": [{
+                  "ApplyServerSideEncryptionByDefault": {
+                    "SSEAlgorithm": "AES256"
+                  }
+                }]
+              }'
+            
+            # Block public access
+            aws s3api put-public-access-block \
+              --bucket "$BUCKET_NAME" \
+              --public-access-block-configuration \
+              "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+            
+            echo "S3 bucket created and configured"
+          else
+            echo "S3 bucket already exists: $BUCKET_NAME"
+          fi
+          
+          echo "Backend setup completed"
+          echo "Bucket: $BUCKET_NAME (in management account)"
+          echo "Deployment account: $DEPLOYMENT_ACCOUNT_ID"
+          echo "State path: $DEPLOYMENT_FOLDER/terraform.tfstate"
+
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: [security-scan, setup-backend]
+    if: |
+      (github.event.inputs.action == 'plan' || github.event.inputs.action == 'apply') &&
+      needs.security-scan.outputs.scan-passed == 'true'
+    outputs:
+      plan-exitcode: ${{ steps.plan.outputs.exitcode }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@c85c95e3d7251135ab7dc9ce3241c5835cc595a9 # v4.0.0
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@651471c36a6092792c552e8b1bef71e592b462d8 # v3.0.0
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6708b3c5206585abc1dbb8d1d # v4.0.2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Create backend configuration
+        env:
+          DEPLOYMENT_FOLDER: ${{ github.event.inputs.deployment_folder }}
+          BUCKET_NAME: ${{ needs.setup-backend.outputs.bucket-name }}
+          AWS_DEFAULT_REGION: ${{ env.AWS_DEFAULT_REGION }}
+        run: |
+          cat > "deployments/$DEPLOYMENT_FOLDER/backend.tf" << EOF
+          terraform {
+            backend "s3" {
+              bucket  = "$BUCKET_NAME"
+              key     = "$DEPLOYMENT_FOLDER/terraform.tfstate"
+              region  = "$AWS_DEFAULT_REGION"
+              encrypt = true
+            }
+          }
+          EOF
+          
+          echo "Backend configuration created for $DEPLOYMENT_FOLDER"
+          cat "deployments/$DEPLOYMENT_FOLDER/backend.tf"
+
+      - name: Terraform Init
+        working-directory: deployments/${{ github.event.inputs.deployment_folder }}
+        run: |
+          echo "Initializing Terraform for ${{ github.event.inputs.deployment_folder }}"
+          terraform init -reconfigure
+
+      - name: Clean old plan files
+        working-directory: deployments/${{ github.event.inputs.deployment_folder }}
+        run: |
+          echo "Removing any existing plan files to avoid version conflicts"
+          rm -f tfplan tfplan.json
+          echo "Clean completed"
+
+      - name: Terraform Validate
+        working-directory: deployments/${{ github.event.inputs.deployment_folder }}
+        run: terraform validate
+
+      - name: Check Terraform State
+        working-directory: deployments/${{ github.event.inputs.deployment_folder }}
+        continue-on-error: true
+        env:
+          DEPLOYMENT_FOLDER: ${{ github.event.inputs.deployment_folder }}
+          BUCKET_NAME: ${{ needs.setup-backend.outputs.bucket-name }}
+        run: |
+          echo "Checking Terraform state..."
+          
+          # List state files in S3 bucket
+          echo "## 📦 S3 Bucket Contents" >> $GITHUB_STEP_SUMMARY
+          echo "Bucket: $BUCKET_NAME" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # List all state files in bucket
+          echo "All state files in bucket:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          aws s3 ls "s3://$BUCKET_NAME/" --recursive | grep terraform.tfstate >> $GITHUB_STEP_SUMMARY || echo "No state files found" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check specific state file for this deployment
+          echo "State file for $DEPLOYMENT_FOLDER:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          aws s3 ls "s3://$BUCKET_NAME/$DEPLOYMENT_FOLDER/terraform.tfstate" >> $GITHUB_STEP_SUMMARY || echo "State file not found at $DEPLOYMENT_FOLDER/terraform.tfstate" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check if state file exists and has resources
+          if terraform state list > /tmp/state_list.txt 2>&1; then
+            RESOURCE_COUNT=$(wc -l < /tmp/state_list.txt)
+            echo "Resources in state: $RESOURCE_COUNT"
+            
+            if [ "$RESOURCE_COUNT" -gt 0 ]; then
+              echo "## ⚠️ Existing State Detected" >> $GITHUB_STEP_SUMMARY
+              echo "Found $RESOURCE_COUNT resources in state file" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "Resources:" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              cat /tmp/state_list.txt >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+            else
+              echo "## ✅ Empty State" >> $GITHUB_STEP_SUMMARY
+              echo "State file exists but contains no resources" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "## ✅ No State File" >> $GITHUB_STEP_SUMMARY
+            echo "No state file found - this is a fresh deployment" >> $GITHUB_STEP_SUMMARY
+            echo "Resources in state: 0"
+          fi
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: deployments/${{ github.event.inputs.deployment_folder }}
+        continue-on-error: true
+        env:
+          DEPLOYMENT_FOLDER: ${{ github.event.inputs.deployment_folder }}
+        run: |
+          echo "Running Terraform plan for $DEPLOYMENT_FOLDER"
+          
+          # Run plan with detailed exit code
+          set +e
+          if [ -f "terraform.tfvars" ]; then
+            echo "Using terraform.tfvars file"
+            terraform plan -out=tfplan -detailed-exitcode -no-color 2>&1 | tee plan-output.txt
+            PLAN_EXIT=${PIPESTATUS[0]}
+          else
+            echo "No terraform.tfvars found, running plan without var file"
+            terraform plan -out=tfplan -detailed-exitcode -no-color 2>&1 | tee plan-output.txt
+            PLAN_EXIT=${PIPESTATUS[0]}
+          fi
+          set -e
+          
+          echo ""
+          echo "=========================================="
+          echo "PIPESTATUS array: ${PIPESTATUS[@]}"
+          echo "Terraform exit code (PIPESTATUS[0]): ${PIPESTATUS[0]}"
+          echo "Plan exit code variable: $PLAN_EXIT"
+          echo "=========================================="
+          
+          # Double-check by looking at plan output
+          if grep -qE "Plan: [0-9]+ to add, [1-9][0-9]* to change|Plan: [1-9][0-9]* to add" plan-output.txt; then
+            echo "⚠️ Plan shows changes but exit code is $PLAN_EXIT"
+            if [ $PLAN_EXIT -eq 0 ]; then
+              echo "🔧 Forcing exit code to 2 (changes detected)"
+              PLAN_EXIT=2
+            fi
+          fi
+          
+          echo "Final exit code: $PLAN_EXIT"
+          
+          # Exit codes: 0=no changes, 1=error, 2=changes
+          if [ $PLAN_EXIT -eq 1 ]; then
+            echo "❌ Terraform plan failed with errors"
+            exit 1
+          elif [ $PLAN_EXIT -eq 2 ]; then
+            echo "✅ Terraform plan succeeded with changes"
+          else
+            echo "✅ Terraform plan succeeded with no changes"
+          fi
+          
+          echo "exitcode=$PLAN_EXIT" >> $GITHUB_OUTPUT
+          
+          # Show plan summary
+          echo "## Terraform Plan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment:** $DEPLOYMENT_FOLDER" >> $GITHUB_STEP_SUMMARY
+          echo "**Exit Code:** $PLAN_EXIT (0=no changes, 2=changes)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tail -n 100 plan-output.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          set -e
+          
+          echo ""
+          echo "=========================================="
+          echo "Plan exit code: $PLAN_EXIT"
+          echo "=========================================="
+          
+          # Exit codes: 0=no changes, 1=error, 2=changes
+          if [ $PLAN_EXIT -eq 1 ]; then
+            echo "❌ Terraform plan failed with errors"
+            exit 1
+          elif [ $PLAN_EXIT -eq 2 ]; then
+            echo "✅ Terraform plan succeeded with changes"
+          else
+            echo "✅ Terraform plan succeeded with no changes"
+          fi
+          
+          echo "exitcode=$PLAN_EXIT" >> $GITHUB_OUTPUT
+          
+          # Show plan summary
+          echo "## Terraform Plan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment:** $DEPLOYMENT_FOLDER" >> $GITHUB_STEP_SUMMARY
+          echo "**Exit Code:** $PLAN_EXIT (0=no changes, 2=changes)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tail -n 100 plan-output.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Check plan result
+        env:
+          DEPLOYMENT_FOLDER: ${{ github.event.inputs.deployment_folder }}
+          EXIT_CODE: ${{ steps.plan.outputs.exitcode }}
+        run: |
+          echo "Plan exit code: $EXIT_CODE"
+          
+          if [ "$EXIT_CODE" = "1" ]; then
+            echo "❌ Plan failed - stopping workflow"
+            exit 1
+          elif [ "$EXIT_CODE" = "2" ]; then
+            echo "✅ Plan has changes - will proceed to apply if requested"
+          else
+            echo "ℹ️ Plan has no changes - apply will be skipped"
+            echo "## ℹ️ No Changes Detected" >> $GITHUB_STEP_SUMMARY
+            echo "Terraform plan completed successfully but found no changes to apply." >> $GITHUB_STEP_SUMMARY
+            echo "Infrastructure is already in the desired state." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload plan artifact
+        if: steps.plan.outputs.exitcode == '2' && github.event.inputs.action == 'apply'
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.1
+        with:
+          name: tfplan-${{ github.event.inputs.deployment_folder }}-${{ github.run_id }}
+          path: deployments/${{ github.event.inputs.deployment_folder }}/tfplan
+          retention-days: 1
+
+  terraform-apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: [security-scan, setup-backend, terraform-plan]
+    if: |
+      github.event.inputs.action == 'apply' && 
+      needs.terraform-plan.outputs.plan-exitcode == '2' &&
+      needs.security-scan.outputs.scan-passed == 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@c85c95e3d7251135ab7dc9ce3241c5835cc595a9 # v4.0.0
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@651471c36a6092792c552e8b1bef71e592b462d8 # v3.0.0
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6708b3c5206585abc1dbb8d1d # v4.0.2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Create backend configuration
+        env:
+          DEPLOYMENT_FOLDER: ${{ github.event.inputs.deployment_folder }}
+          BUCKET_NAME: ${{ needs.setup-backend.outputs.bucket-name }}
+          AWS_DEFAULT_REGION: ${{ env.AWS_DEFAULT_REGION }}
+        run: |
+          cat > "deployments/$DEPLOYMENT_FOLDER/backend.tf" << EOF
+          terraform {
+            backend "s3" {
+              bucket  = "$BUCKET_NAME"
+              key     = "$DEPLOYMENT_FOLDER/terraform.tfstate"
+              region  = "$AWS_DEFAULT_REGION"
+              encrypt = true
+            }
+          }
+          EOF
+
+      - name: Download plan artifact
+        if: needs.terraform-plan.outputs.plan-exitcode == '2'
+        uses: actions/download-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.1
+        with:
+          name: tfplan-${{ github.event.inputs.deployment_folder }}-${{ github.run_id }}
+          path: deployments/${{ github.event.inputs.deployment_folder }}
+
+      - name: Terraform Init
+        working-directory: deployments/${{ github.event.inputs.deployment_folder }}
+        run: terraform init
+
+      - name: Terraform Apply
+        working-directory: deployments/${{ github.event.inputs.deployment_folder }}
+        env:
+          DEPLOYMENT_FOLDER: ${{ github.event.inputs.deployment_folder }}
+        run: |
+          echo "Applying Terraform for $DEPLOYMENT_FOLDER"
+          
+          # Always use the plan file from the previous step
+          if [ -f "tfplan" ]; then
+            echo "Applying saved plan file"
+            terraform apply -auto-approve tfplan
+          else
+            echo "❌ Error: Plan file not found. This should not happen."
+            exit 1
+          fi
+          
+          echo "## Terraform Apply Completed" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment:** $DEPLOYMENT_FOLDER" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ✅ Success" >> $GITHUB_STEP_SUMMARY
+          echo "**Timestamp:** $(date -u)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Terraform Output
+        working-directory: deployments/${{ github.event.inputs.deployment_folder }}
+        run: |
+          echo "Capturing Terraform outputs"
+          terraform output -json > outputs.json || echo "{}" > outputs.json
+          
+          echo "## Terraform Outputs" >> $GITHUB_STEP_SUMMARY
+          echo '```json' >> $GITHUB_STEP_SUMMARY
+          cat outputs.json >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload outputs
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.1
+        with:
+          name: outputs-${{ github.event.inputs.deployment_folder }}
+          path: deployments/${{ github.event.inputs.deployment_folder }}/outputs.json
+          retention-days: 30
+
+  terraform-destroy:
+    name: Terraform Destroy
+    runs-on: ubuntu-latest
+    needs: [security-scan, setup-backend]
+    if: |
+      github.event.inputs.action == 'destroy' &&
+      needs.security-scan.outputs.scan-passed == 'true'
+    environment:
+      name: destroy-${{ github.event.inputs.deployment_folder }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@c85c95e3d7251135ab7dc9ce3241c5835cc595a9 # v4.0.0
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@651471c36a6092792c552e8b1bef71e592b462d8 # v3.0.0
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6708b3c5206585abc1dbb8d1d # v4.0.2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Create backend configuration
+        env:
+          DEPLOYMENT_FOLDER: ${{ github.event.inputs.deployment_folder }}
+          BUCKET_NAME: ${{ needs.setup-backend.outputs.bucket-name }}
+          AWS_DEFAULT_REGION: ${{ env.AWS_DEFAULT_REGION }}
+        run: |
+          cat > "deployments/$DEPLOYMENT_FOLDER/backend.tf" << EOF
+          terraform {
+            backend "s3" {
+              bucket  = "$BUCKET_NAME"
+              key     = "$DEPLOYMENT_FOLDER/terraform.tfstate"
+              region  = "$AWS_DEFAULT_REGION"
+              encrypt = true
+            }
+          }
+          EOF
+
+      - name: Terraform Init
+        working-directory: deployments/${{ github.event.inputs.deployment_folder }}
+        run: terraform init
+
+      - name: Confirm Destroy
+        env:
+          DEPLOYMENT_FOLDER: ${{ github.event.inputs.deployment_folder }}
+          AUTO_APPROVE: ${{ github.event.inputs.auto_approve }}
+        run: |
+          echo "## ⚠️ DESTROY CONFIRMATION" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment:** $DEPLOYMENT_FOLDER" >> $GITHUB_STEP_SUMMARY
+          echo "**Action:** DESTROY ALL RESOURCES" >> $GITHUB_STEP_SUMMARY
+          echo "**Auto-approve:** $AUTO_APPROVE" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ This will permanently delete all infrastructure in $DEPLOYMENT_FOLDER" >> $GITHUB_STEP_SUMMARY
+
+      - name: Terraform Destroy Plan
+        working-directory: deployments/${{ github.event.inputs.deployment_folder }}
+        env:
+          DEPLOYMENT_FOLDER: ${{ github.event.inputs.deployment_folder }}
+        run: |
+          echo "Planning destroy for $DEPLOYMENT_FOLDER"
+          
+          if [ -f "terraform.tfvars" ]; then
+            terraform plan -destroy -out=destroy-plan -var-file=terraform.tfvars
+          else
+            terraform plan -destroy -out=destroy-plan
+          fi
+          
+          # Show destroy plan
+          terraform show -no-color destroy-plan > destroy-plan-output.txt
+          
+          echo "## Destroy Plan" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          head -n 100 destroy-plan-output.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Terraform Destroy
+        working-directory: deployments/${{ github.event.inputs.deployment_folder }}
+        env:
+          DEPLOYMENT_FOLDER: ${{ github.event.inputs.deployment_folder }}
+          AUTO_APPROVE: ${{ github.event.inputs.auto_approve }}
+        run: |
+          echo "Destroying infrastructure for $DEPLOYMENT_FOLDER"
+          
+          if [ "$AUTO_APPROVE" = "true" ]; then
+            echo "Auto-approve enabled - destroying without confirmation"
+            terraform apply -auto-approve destroy-plan
+          else
+            echo "Manual approval required (GitHub environment protection)"
+            terraform apply destroy-plan
+          fi
+          
+          echo "## Terraform Destroy Completed" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment:** $DEPLOYMENT_FOLDER" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ✅ Resources destroyed" >> $GITHUB_STEP_SUMMARY
+          echo "**Timestamp:** $(date -u)" >> $GITHUB_STEP_SUMMARY

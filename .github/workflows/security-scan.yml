@@ -1,0 +1,302 @@
+name: Security Scan with Checkov
+
+on:
+  workflow_dispatch:
+    inputs:
+      scan_path:
+        description: 'Path to scan (leave empty for entire repo)'
+        required: false
+        default: '.'
+        type: choice
+        options:
+          - '.'
+          - 'deployments/network-core'
+          - 'deployments/network-egress'
+          - 'deployments/network-inspection'
+          - 'deployments/workload-production'
+          - 'deployments/workload-development'
+          - 'modules'
+      severity:
+        description: 'Minimum severity level to fail pipeline'
+        required: false
+        default: 'HIGH'
+        type: choice
+        options:
+          - 'CRITICAL'
+          - 'HIGH'
+          - 'MEDIUM'
+          - 'LOW'
+      fail_on_issues:
+        description: 'Fail pipeline if security issues found'
+        required: false
+        default: true
+        type: boolean
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths:
+      - '**.tf'
+      - '**.tfvars'
+      - 'modules/**'
+      - 'deployments/**'
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - '**.tf'
+      - '**.tfvars'
+      - 'modules/**'
+      - 'deployments/**'
+
+env:
+  CHECKOV_VERSION: "3.2.0"
+
+jobs:
+  checkov-scan:
+    name: Checkov Security Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@c85c95e3d7251135ab7dc9ce3241c5835cc595a9 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@0a5c61591373683ada2c718d72e20e999d6742a7 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Checkov
+        run: |
+          pip install checkov==${{ env.CHECKOV_VERSION }}
+          checkov --version
+
+      - name: Run Checkov scan
+        id: checkov
+        continue-on-error: true
+        env:
+          SCAN_PATH: ${{ github.event.inputs.scan_path || '.' }}
+          SEVERITY: ${{ github.event.inputs.severity || 'HIGH' }}
+          FAIL_ON_ISSUES: ${{ github.event.inputs.fail_on_issues || 'true' }}
+        run: |
+          echo "## 🔒 Checkov Security Scan" >> $GITHUB_STEP_SUMMARY
+          echo "**Scan Path:** $SCAN_PATH" >> $GITHUB_STEP_SUMMARY
+          echo "**Minimum Severity:** $SEVERITY" >> $GITHUB_STEP_SUMMARY
+          echo "**Fail on Issues:** $FAIL_ON_ISSUES" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Run Checkov with multiple output formats
+          checkov \
+            --directory "$SCAN_PATH" \
+            --config-file "$GITHUB_WORKSPACE/.checkov.yml" \
+            --output cli \
+            --output json \
+            --output-file-path console,checkov-results.json \
+            | tee checkov-output.txt
+          
+          CHECKOV_EXIT_CODE=${PIPESTATUS[0]}
+          echo "exit_code=$CHECKOV_EXIT_CODE" >> $GITHUB_OUTPUT
+          
+          # Parse results
+          if [ -f "checkov-results.json" ]; then
+            PASSED=$(jq '.summary.passed' checkov-results.json)
+            FAILED=$(jq '.summary.failed' checkov-results.json)
+            SKIPPED=$(jq '.summary.skipped' checkov-results.json)
+            
+            echo "**Results:**" >> $GITHUB_STEP_SUMMARY
+            echo "- ✅ Passed: $PASSED" >> $GITHUB_STEP_SUMMARY
+            echo "- ❌ Failed: $FAILED" >> $GITHUB_STEP_SUMMARY
+            echo "- ⏭️ Skipped: $SKIPPED" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            # Count issues by severity
+            CRITICAL_COUNT=$(jq '[.results.failed_checks[] | select(.severity == "CRITICAL")] | length' checkov-results.json)
+            HIGH_COUNT=$(jq '[.results.failed_checks[] | select(.severity == "HIGH")] | length' checkov-results.json)
+            MEDIUM_COUNT=$(jq '[.results.failed_checks[] | select(.severity == "MEDIUM")] | length' checkov-results.json)
+            LOW_COUNT=$(jq '[.results.failed_checks[] | select(.severity == "LOW")] | length' checkov-results.json)
+            
+            echo "**Issues by Severity:**" >> $GITHUB_STEP_SUMMARY
+            echo "- 🔴 Critical: $CRITICAL_COUNT" >> $GITHUB_STEP_SUMMARY
+            echo "- 🟠 High: $HIGH_COUNT" >> $GITHUB_STEP_SUMMARY
+            echo "- 🟡 Medium: $MEDIUM_COUNT" >> $GITHUB_STEP_SUMMARY
+            echo "- 🟢 Low: $LOW_COUNT" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            # Store counts for later steps
+            echo "critical_count=$CRITICAL_COUNT" >> $GITHUB_OUTPUT
+            echo "high_count=$HIGH_COUNT" >> $GITHUB_OUTPUT
+            echo "medium_count=$MEDIUM_COUNT" >> $GITHUB_OUTPUT
+            echo "low_count=$LOW_COUNT" >> $GITHUB_OUTPUT
+            echo "total_failed=$FAILED" >> $GITHUB_OUTPUT
+            
+            # Show top 10 failed checks
+            if [ "$FAILED" -gt 0 ]; then
+              echo "### ⚠️ Top Failed Checks" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              jq -r '.results.failed_checks[0:10] | .[] | "**[\(.severity)] \(.check_id)**: \(.check_name)\n- File: `\(.file_path):\(.file_line_range[0])`\n- Guideline: \(.guideline // "N/A")\n"' checkov-results.json >> $GITHUB_STEP_SUMMARY
+              
+              if [ "$FAILED" -gt 10 ]; then
+                echo "_... and $(($FAILED - 10)) more issues. Download the full report from artifacts._" >> $GITHUB_STEP_SUMMARY
+              fi
+            fi
+          fi
+
+      - name: Generate detailed report
+        if: always()
+        env:
+          SCAN_PATH: ${{ github.event.inputs.scan_path || '.' }}
+        run: |
+          # Generate JUnit XML report
+          checkov \
+            --directory "$SCAN_PATH" \
+            --config-file "$GITHUB_WORKSPACE/.checkov.yml" \
+            --output junitxml \
+            --soft-fail \
+            > checkov-report.xml || true
+          
+          # Generate SARIF for GitHub Security tab (written to file explicitly)
+          checkov \
+            --directory "$SCAN_PATH" \
+            --config-file "$GITHUB_WORKSPACE/.checkov.yml" \
+            --output sarif \
+            --soft-fail \
+            > checkov-results.sarif || true
+          
+          # Verify SARIF was generated
+          if [ ! -s checkov-results.sarif ]; then
+            echo '{"version":"2.1.0","runs":[]}' > checkov-results.sarif
+          fi
+
+      - name: Upload Checkov results
+        if: always()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        with:
+          name: checkov-results
+          path: |
+            checkov-results.json
+            checkov-report.xml
+            checkov-results.sarif
+            checkov-output.txt
+          retention-days: 30
+
+      - name: Upload SARIF to GitHub Security
+        if: always() && github.event_name != 'workflow_dispatch'
+        uses: github/codeql-action/upload-sarif@38697555549f1db7851b81482ff19f1fa5c4fedc # v4
+        with:
+          sarif_file: checkov-results.sarif
+          category: checkov
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            let comment = '## 🔒 Checkov Security Scan Results\n\n';
+            
+            try {
+              const results = JSON.parse(fs.readFileSync('checkov-results.json', 'utf8'));
+              const summary = results.summary;
+              
+              comment += `**Summary:**\n`;
+              comment += `- ✅ Passed: ${summary.passed}\n`;
+              comment += `- ❌ Failed: ${summary.failed}\n`;
+              comment += `- ⏭️ Skipped: ${summary.skipped}\n\n`;
+              
+              if (summary.failed > 0) {
+                comment += `### ⚠️ Failed Checks\n\n`;
+                
+                const failedChecks = results.results.failed_checks || [];
+                const topFailures = failedChecks.slice(0, 10);
+                
+                topFailures.forEach(check => {
+                  comment += `**${check.check_id}**: ${check.check_name}\n`;
+                  comment += `- File: \`${check.file_path}\`\n`;
+                  comment += `- Severity: ${check.severity || 'MEDIUM'}\n`;
+                  comment += `- Guideline: ${check.guideline || 'N/A'}\n\n`;
+                });
+                
+                if (failedChecks.length > 10) {
+                  comment += `\n_... and ${failedChecks.length - 10} more. Download the full report from artifacts._\n`;
+                }
+              }
+            } catch (error) {
+              comment += `Unable to parse results: ${error.message}\n`;
+            }
+            
+            comment += `\n📊 [View detailed results in the workflow artifacts](${context.payload.repository.html_url}/actions/runs/${context.runId})`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+      - name: Check scan status
+        env:
+          CRITICAL_COUNT: ${{ steps.checkov.outputs.critical_count || 0 }}
+          HIGH_COUNT: ${{ steps.checkov.outputs.high_count || 0 }}
+          MEDIUM_COUNT: ${{ steps.checkov.outputs.medium_count || 0 }}
+          TOTAL_FAILED: ${{ steps.checkov.outputs.total_failed || 0 }}
+          SEVERITY: ${{ github.event.inputs.severity || 'HIGH' }}
+          FAIL_ON_ISSUES: ${{ github.event.inputs.fail_on_issues }}
+        run: |
+          # Default to true for push/PR events
+          if [ -z "$FAIL_ON_ISSUES" ] || [ "$FAIL_ON_ISSUES" = "true" ]; then
+            SHOULD_FAIL=true
+          else
+            SHOULD_FAIL=false
+          fi
+          
+          echo "Security Scan Results:"
+          echo "  Critical: $CRITICAL_COUNT"
+          echo "  High: $HIGH_COUNT"
+          echo "  Medium: $MEDIUM_COUNT"
+          echo "  Total Failed: $TOTAL_FAILED"
+          echo ""
+          
+          # Determine if we should fail based on severity threshold
+          FAIL_BUILD=false
+          
+          if [ "$SEVERITY" = "CRITICAL" ] && [ "$CRITICAL_COUNT" -gt 0 ]; then
+            FAIL_BUILD=true
+            echo "🔴 CRITICAL severity issues found: $CRITICAL_COUNT"
+          elif [ "$SEVERITY" = "HIGH" ] && [ $((CRITICAL_COUNT + HIGH_COUNT)) -gt 0 ]; then
+            FAIL_BUILD=true
+            echo "🔴 CRITICAL/HIGH severity issues found: $((CRITICAL_COUNT + HIGH_COUNT))"
+          elif [ "$SEVERITY" = "MEDIUM" ] && [ $((CRITICAL_COUNT + HIGH_COUNT + MEDIUM_COUNT)) -gt 0 ]; then
+            FAIL_BUILD=true
+            echo "🔴 CRITICAL/HIGH/MEDIUM severity issues found: $((CRITICAL_COUNT + HIGH_COUNT + MEDIUM_COUNT))"
+          elif [ "$SEVERITY" = "LOW" ] && [ "$TOTAL_FAILED" -gt 0 ]; then
+            FAIL_BUILD=true
+            echo "🔴 Security issues found: $TOTAL_FAILED"
+          fi
+          
+          if [ "$FAIL_BUILD" = true ] && [ "$SHOULD_FAIL" = true ]; then
+            echo ""
+            echo "❌ PIPELINE FAILED: Security issues detected above threshold"
+            echo ""
+            echo "## 🚨 Security Scan Failed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Security issues were detected that exceed the severity threshold ($SEVERITY)." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Action Required:**" >> $GITHUB_STEP_SUMMARY
+            echo "1. Review the failed checks above" >> $GITHUB_STEP_SUMMARY
+            echo "2. Fix the security issues in your Terraform code" >> $GITHUB_STEP_SUMMARY
+            echo "3. Push the fixes to re-run the security scan" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Alternative:** If these are false positives, add them to .checkov.yml skip-check list with justification" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          elif [ "$TOTAL_FAILED" -gt 0 ]; then
+            echo "⚠️ Security issues found but below severity threshold ($SEVERITY)"
+            echo "Review the results and consider fixing these issues"
+          else
+            echo "✅ No security issues found - scan passed!"
+          fi
