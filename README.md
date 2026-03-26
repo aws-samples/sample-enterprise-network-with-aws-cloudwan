@@ -209,6 +209,20 @@ checkov -d deployments/network-core
 
 ---
 
+### CI/CD Pipeline
+
+The repository includes two GitHub Actions workflows:
+
+- `security-scan.yml` — Runs Checkov on every push/PR. Works out of the box with no additional configuration.
+- `terraform-deploy.yml` — Plans and applies Terraform changes. Requires the following GitHub repository secrets to be configured with your own AWS credentials:
+  - `AWS_ACCESS_KEY_ID`
+  - `AWS_SECRET_ACCESS_KEY`
+  - `AWS_ACCOUNT_ID`
+
+> **Note:** For production use, consider replacing stored credentials with [OIDC federation](https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services) for short-lived, keyless authentication.
+
+---
+
 ## Cleanup / Teardown
 
 To destroy all deployed resources, run `terraform destroy` in each deployment folder in reverse order of creation. The recommended teardown sequence:
