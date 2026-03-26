@@ -64,10 +64,10 @@ jobs:
     
     steps:
       - name: Checkout code
-        uses: actions/checkout@c85c95e3d7251135ab7dc9ce3241c5835cc595a9 # v4
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@0a5c61591373683ada2c718d72e20e999d6742a7 # v5
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
@@ -174,7 +174,7 @@ jobs:
 
       - name: Upload Checkov results
         if: always()
-        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        uses: actions/upload-artifact@v4
         with:
           name: checkov-results
           path: |
@@ -186,14 +186,14 @@ jobs:
 
       - name: Upload SARIF to GitHub Security
         if: always() && github.event_name != 'workflow_dispatch'
-        uses: github/codeql-action/upload-sarif@38697555549f1db7851b81482ff19f1fa5c4fedc # v4
+        uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: checkov-results.sarif
           category: checkov
 
       - name: Comment on PR
         if: github.event_name == 'pull_request' && always()
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
