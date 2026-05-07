@@ -214,7 +214,7 @@ checkov -d deployments/network-core
 The repository includes two GitHub Actions workflows:
 
 - `security-scan.yml` — Runs Checkov on every push/PR. Works out of the box with no additional configuration.
-- `terraform-deploy.yml` — Plans and applies Terraform changes. Requires the following GitHub repository secrets to be configured with your own AWS credentials:
+- `terraform-deploy.yml` — Plans and applies Terraform changes. Requires the following [GitHub repository secrets](https://docs.github.com/en/actions/security-guides/using-secrets-in-github-actions) to be configured with your own AWS credentials:
   - `AWS_ACCESS_KEY_ID`
   - `AWS_SECRET_ACCESS_KEY`
   - `AWS_ACCOUNT_ID`
