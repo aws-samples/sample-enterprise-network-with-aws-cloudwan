@@ -73,7 +73,8 @@ jobs:
 
       - name: Install Checkov
         run: |
-          pip install checkov==${{ env.CHECKOV_VERSION }}
+          # CHECKOV_VERSION comes from the workflow-level env block
+          pip install "checkov==$CHECKOV_VERSION"
           checkov --version
 
       - name: Run Checkov scan

@@ -97,11 +97,11 @@ jobs:
 
       - name: Evaluate scan results
         id: scan-result
+        env:
+          CRITICAL_COUNT: ${{ steps.checkov.outputs.critical_count || 0 }}
+          HIGH_COUNT: ${{ steps.checkov.outputs.high_count || 0 }}
         run: |
-          CRITICAL_COUNT="${{ steps.checkov.outputs.critical_count || 0 }}"
-          HIGH_COUNT="${{ steps.checkov.outputs.high_count || 0 }}"
-          
-          if [ $((CRITICAL_COUNT + HIGH_COUNT)) -gt 0 ]; then
+          if [ $(( ${CRITICAL_COUNT:-0} + ${HIGH_COUNT:-0} )) -gt 0 ]; then
             echo "passed=false" >> $GITHUB_OUTPUT
             echo "## 🚨 Security Scan Failed" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
@@ -274,8 +274,10 @@ jobs:
 
       - name: Terraform Init
         working-directory: deployments/${{ github.event.inputs.deployment_folder }}
+        env:
+          DEPLOYMENT_FOLDER: ${{ github.event.inputs.deployment_folder }}
         run: |
-          echo "Initializing Terraform for ${{ github.event.inputs.deployment_folder }}"
+          echo "Initializing Terraform for $DEPLOYMENT_FOLDER"
           terraform init -reconfigure
 
       - name: Clean old plan files
